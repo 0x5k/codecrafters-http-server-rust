@@ -28,10 +28,9 @@ fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
     let mut buffer = [0; 1024]; // 1KB buffer, adjust size as needed
     let bytes_read = stream.read(&mut buffer)?;
 
-    // If no bytes are read, it might be an empty request or closed connection
     if bytes_read == 0 {
         println!("Received empty request or connection closed.");
-        return Ok(()); // Nothing more to do
+        return Ok(());
     }
 
     let request_str = String::from_utf8_lossy(&buffer[..bytes_read]);
@@ -63,6 +62,20 @@ fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
                 echo_str.len()
             );
             response_body = echo_str;
+        } else if path == "/user-agent" {
+            // Find the User-Agent header in the request
+            let user_agent = request_str
+                .lines()
+                .find(|line| line.starts_with("User-Agent:"))
+                .map(|line| line["User-Agent:".len()..].trim())
+                .unwrap_or("");
+
+            status_line = "HTTP/1.1 200 OK\r\n";
+            headers = format!(
+                "Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+                user_agent.len()
+            );
+            response_body = user_agent;
         }
     } else {
         println!("Received malformed request line: {}", request_line);
