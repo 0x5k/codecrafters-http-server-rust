@@ -23,3 +23,8 @@ set -e # Exit early if any commands fail
 # - Edit .codecrafters/run.sh to change how your program runs remotely
 exec /tmp/codecrafters-build-http-server-rust/release/codecrafters-http-server "$@"
 # -- cargo run -- --directory /tmp/myfiles
+
+
+# Run the server with --directory flag
+# docker build -t http-server .
+# docker run --rm -p 4221:4221 -v $(pwd):/app http-server

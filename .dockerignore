@@ -1,0 +1,17 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Rust
+target/
+Cargo.lock
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Other
+*.sh
+.codecrafters/
+codecrafters.yml
