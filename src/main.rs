@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write}; // Added BufRead, BufReader
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::thread;
+// Removed unused import: use std::time::Duration;
 
 #[allow(unused_imports)]
 fn main() {
     // --- Argument Parsing ---
     let args: Vec<String> = env::args().collect();
-    let mut directory = String::from("."); // Default to current directory if not specified
+    let mut directory = String::from("."); // Default to current directory
 
     if let Some(index) = args.iter().position(|arg| arg == "--directory") {
         if let Some(dir) = args.get(index + 1) {
@@ -30,11 +31,34 @@ fn main() {
         match stream {
             Ok(stream) => {
                 let dir_clone = directory.clone();
+                // Note: Setting timeouts might require careful handling with persistent connections
+                // stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                // stream.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+
                 thread::spawn(move || {
-                    println!("Accepted new connection");
+                    println!(
+                        "Accepted new connection from: {}",
+                        stream
+                            .peer_addr()
+                            .map_or_else(|_| "unknown".to_string(), |addr| addr.to_string())
+                    );
+                    // Pass the directory to the handler
+                    // Pass the stream itself now, handle_connection will manage reading/writing
                     if let Err(e) = handle_connection(stream, &dir_clone) {
-                        println!("Failed to handle connection: {}", e);
+                        // Log errors that cause the connection handler to terminate
+                        match e.kind() {
+                            // Ignore BrokenPipe and ConnectionReset errors as they often mean the client disconnected normally
+                            std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::UnexpectedEof => {
+                                // Also ignore UnexpectedEof here
+                                println!("Client disconnected.");
+                            }
+                            // Log other I/O errors
+                            _ => println!("Connection handler error: {}", e),
+                        }
                     }
+                    println!("Connection closed.");
                 });
             }
             Err(e) => {
@@ -45,183 +69,270 @@ fn main() {
 }
 
 // Function to parse headers into a HashMap
-fn parse_headers(reader: &mut BufReader<&TcpStream>) -> HashMap<String, String> {
+// Takes BufReader by mutable reference, consumes header lines
+// Note: Takes BufReader<(&TcpStream)> to work with the reader created in handle_connection
+fn parse_headers(reader: &mut BufReader<&TcpStream>) -> std::io::Result<HashMap<String, String>> {
     let mut headers = HashMap::new();
     let mut header_line = String::new();
 
     loop {
         // Read line by line until an empty line (\r\n) is encountered
-        match reader.read_line(&mut header_line) {
-            Ok(0) => break, // Connection closed unexpectedly
-            Ok(_) => {
-                // Trim whitespace (including \r\n)
-                let trimmed_line = header_line.trim();
-                if trimmed_line.is_empty() {
-                    // Empty line signifies end of headers
-                    break;
-                }
-                // Split header name and value
-                if let Some((name, value)) = trimmed_line.split_once(": ") {
-                    headers.insert(name.to_lowercase(), value.to_string());
-                }
-                header_line.clear(); // Clear string for the next line
-            }
-            Err(_) => break, // Error reading line
+        let bytes_read = reader.read_line(&mut header_line)?;
+        if bytes_read == 0 {
+            // Connection closed unexpectedly during header reading
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Connection closed while reading headers",
+            ));
         }
+
+        // Trim whitespace (including \r\n)
+        let trimmed_line = header_line.trim();
+        if trimmed_line.is_empty() {
+            // Empty line signifies end of headers
+            break;
+        }
+        // Split header name and value
+        if let Some((name, value)) = trimmed_line.split_once(": ") {
+            headers.insert(name.to_lowercase(), value.trim().to_string()); // Trim header value too
+        } else {
+            // Malformed header line, could return error or ignore
+            println!("Warning: Malformed header line ignored: {}", trimmed_line);
+        }
+        header_line.clear(); // Clear string for the next line
     }
-    headers
+    Ok(headers)
 }
 
+// Handles multiple requests on a single connection
+// Takes ownership of the stream
 fn handle_connection(mut stream: TcpStream, directory: &str) -> std::io::Result<()> {
-    // Use BufReader for more efficient reading, especially line-by-line for headers
-    let mut reader = BufReader::new(&stream);
+    // Loop to handle multiple requests on the same connection
+    loop {
+        // Create a BufReader for *each request* within the loop.
+        // This limits the scope of the immutable borrow of `stream`.
+        let mut reader = BufReader::new(&stream); // Immutable borrow starts here
 
-    // Read the request line
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
-        println!("Received empty request or connection closed.");
-        return Ok(()); // Client closed connection
-    }
-    println!("Request Line: {}", request_line.trim());
-
-    // Parse the request line
-    let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
-    if parts.len() < 3 {
-        println!("Malformed request line: {}", request_line.trim());
-        // Send 400 Bad Request for malformed request line
-        stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")?;
-        stream.flush()?;
-        return Ok(());
-    }
-    let method = parts[0];
-    let path = parts[1];
-    // let http_version = parts[2]; // Not used yet
-
-    // Parse headers
-    let headers_map = parse_headers(&mut reader);
-    println!("Headers: {:?}", headers_map); // Log parsed headers
-
-    // Default response: 404 Not Found
-    let mut status_line = "HTTP/1.1 404 Not Found\r\n";
-    let mut response_headers = "\r\n".to_string(); // Default: just CRLF ending headers
-    let mut response_body: Option<Vec<u8>> = None;
-
-    // --- Routing Logic ---
-    match (method, path) {
-        ("GET", "/") => {
-            status_line = "HTTP/1.1 200 OK\r\n";
-            // response_headers remains default (just CRLF)
+        // --- Read Request Line ---
+        let mut request_line = String::new();
+        match reader.read_line(&mut request_line) {
+            Ok(0) => {
+                println!("Client closed connection gracefully.");
+                break; // Exit loop, close connection
+            }
+            Ok(_) => {
+                println!("Request Line: {}", request_line.trim());
+            }
+            Err(e) => {
+                println!("Error reading request line: {}", e);
+                return Err(e); // Propagate I/O error up
+            }
         }
-        ("GET", p) if p.starts_with("/echo/") => {
-            let echo_str = &p["/echo/".len()..];
-            status_line = "HTTP/1.1 200 OK\r\n";
-            response_headers = format!(
-                "Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
-                echo_str.len()
+
+        let trimmed_request_line = request_line.trim();
+        if trimmed_request_line.is_empty() {
+            println!("Received empty line, continuing to listen...");
+            request_line.clear();
+            continue; // Go to next loop iteration
+        }
+
+        // --- Parse Request Line ---
+        let parts: Vec<&str> = trimmed_request_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            // Allow requests without HTTP version for simplicity if needed, though spec requires 3
+            println!(
+                "Malformed request line ({} parts): {}",
+                parts.len(),
+                trimmed_request_line
             );
-            response_body = Some(echo_str.as_bytes().to_vec());
+            // Respond with 400 and close
+            // Need mutable borrow here, but reader still exists. We handle response writing later.
+            stream.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")?;
+            stream.flush()?;
+            break; // Close connection
         }
-        ("GET", "/user-agent") => {
-            if let Some(user_agent) = headers_map.get("user-agent") {
-                status_line = "HTTP/1.1 200 OK\r\n";
-                response_headers = format!(
-                    "Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
-                    user_agent.len()
-                );
-                response_body = Some(user_agent.as_bytes().to_vec());
-            } else {
-                // Should technically not happen if User-Agent is always sent, but handle defensively
-                status_line = "HTTP/1.1 400 Bad Request\r\n"; // Or maybe 500?
-                response_headers = "Content-Type: text/plain\r\n\r\n".to_string();
-                response_body = Some(b"User-Agent header not found".to_vec());
-            }
-        }
-        ("GET", p) if p.starts_with("/files/") => {
-            let filename = &p["/files/".len()..];
-            let file_path = Path::new(directory).join(filename);
-            println!("Attempting to serve file: {:?}", file_path);
+        let method = parts[0];
+        let path = parts[1];
 
-            match fs::read(&file_path) {
-                Ok(contents) => {
-                    status_line = "HTTP/1.1 200 OK\r\n";
-                    response_headers = format!(
-                        "Content-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
-                        contents.len()
-                    );
-                    response_body = Some(contents);
-                    println!("Successfully read file: {:?}", file_path);
-                }
-                Err(e) => {
-                    println!("Failed to read file {:?}: {}", file_path, e);
-                    // Keep default 404 status_line and response_headers
-                }
+        // --- Parse Headers ---
+        // Pass the reader mutably to consume header lines
+        let headers_map = match parse_headers(&mut reader) {
+            Ok(headers) => headers,
+            Err(e) => {
+                println!("Error parsing headers: {}", e);
+                stream.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")?;
+                stream.flush()?;
+                break; // Close connection
             }
-        }
-        // --- POST /files handling ---
-        ("POST", p) if p.starts_with("/files/") => {
-            let filename = &p["/files/".len()..];
-            let file_path = Path::new(directory).join(filename);
-            println!("Attempting to create file: {:?}", file_path);
+        };
+        println!("Headers: {:?}", headers_map);
 
-            // Get Content-Length from headers
+        // --- Determine if connection should close ---
+        let mut should_close = headers_map
+            .get("connection")
+            .map_or(false, |h| h.eq_ignore_ascii_case("close"));
+
+        // --- Read Body (if necessary, e.g., for POST) ---
+        let mut request_body_content: Option<Vec<u8>> = None;
+        if method == "POST" && path.starts_with("/files/") {
             if let Some(content_length_str) = headers_map.get("content-length") {
                 if let Ok(content_length) = content_length_str.parse::<usize>() {
-                    // Read the exact number of bytes for the body
                     let mut body_buffer = vec![0; content_length];
+                    // Read the body using the *same reader*
                     if reader.read_exact(&mut body_buffer).is_ok() {
-                        // Write the body content to the file
-                        match fs::write(&file_path, &body_buffer) {
+                        request_body_content = Some(body_buffer);
+                    } else {
+                        println!("Failed to read request body fully");
+                        // Prepare 400 response below, set should_close
+                        should_close = true;
+                        // We can't write the response yet as reader still borrows stream
+                    }
+                } else {
+                    println!("Invalid Content-Length header: {}", content_length_str);
+                    should_close = true;
+                }
+            } else {
+                println!("Missing Content-Length header for POST");
+                should_close = true; // 411 Length Required implies close usually
+            }
+        }
+
+        // --- End of Reading Phase ---
+        // The immutable borrow of `stream` by `reader` ends here as `reader` goes out of scope
+        // before the response writing starts.
+
+        // --- Routing Logic & Response Preparation ---
+        let mut status_line = "HTTP/1.1 404 Not Found\r\n";
+        let mut response_headers_vec: Vec<String> = Vec::new();
+        let mut response_body: Option<Vec<u8>> = None;
+
+        // Check for errors detected during body reading first
+        if method == "POST"
+            && path.starts_with("/files/")
+            && request_body_content.is_none()
+            && !should_close
+        {
+            // This case shouldn't happen if should_close was set correctly above, but as safeguard:
+            println!("Internal state error: POST body read failed but not marked for close.");
+            status_line = "HTTP/1.1 500 Internal Server Error\r\n";
+            should_close = true;
+        } else if method == "POST"
+            && path.starts_with("/files/")
+            && headers_map.get("content-length").is_none()
+        {
+            status_line = "HTTP/1.1 411 Length Required\r\n";
+            // should_close already true
+        } else if method == "POST" && path.starts_with("/files/") && request_body_content.is_none()
+        {
+            status_line = "HTTP/1.1 400 Bad Request\r\n";
+            // should_close already true
+        } else {
+            // Proceed with normal routing if no body read error occurred
+            match (method, path) {
+                ("GET", "/") => {
+                    status_line = "HTTP/1.1 200 OK\r\n";
+                }
+                ("GET", p) if p.starts_with("/echo/") => {
+                    let echo_str = &p["/echo/".len()..];
+                    status_line = "HTTP/1.1 200 OK\r\n";
+                    response_headers_vec.push(format!("Content-Type: text/plain"));
+                    response_headers_vec.push(format!("Content-Length: {}", echo_str.len()));
+                    response_body = Some(echo_str.as_bytes().to_vec());
+                }
+                ("GET", "/user-agent") => {
+                    if let Some(user_agent) = headers_map.get("user-agent") {
+                        status_line = "HTTP/1.1 200 OK\r\n";
+                        response_headers_vec.push(format!("Content-Type: text/plain"));
+                        response_headers_vec.push(format!("Content-Length: {}", user_agent.len()));
+                        response_body = Some(user_agent.as_bytes().to_vec());
+                    } else {
+                        status_line = "HTTP/1.1 400 Bad Request\r\n"; // Or just respond with empty if UA is optional?
+                        response_headers_vec.push(format!("Content-Type: text/plain"));
+                        let body_bytes = b"User-Agent header not found";
+                        response_headers_vec.push(format!("Content-Length: {}", body_bytes.len()));
+                        response_body = Some(body_bytes.to_vec());
+                    }
+                }
+                ("GET", p) if p.starts_with("/files/") => {
+                    let filename = &p["/files/".len()..];
+                    let file_path = Path::new(directory).join(filename);
+                    println!("Attempting to serve file: {:?}", file_path);
+
+                    match fs::read(&file_path) {
+                        Ok(contents) => {
+                            status_line = "HTTP/1.1 200 OK\r\n";
+                            response_headers_vec
+                                .push(format!("Content-Type: application/octet-stream"));
+                            response_headers_vec
+                                .push(format!("Content-Length: {}", contents.len()));
+                            response_body = Some(contents);
+                            println!("Successfully read file: {:?}", file_path);
+                        }
+                        Err(e) => {
+                            println!("Failed to read file {:?}: {}", file_path, e);
+                            // Keep default 404
+                        }
+                    }
+                }
+                ("POST", p) if p.starts_with("/files/") => {
+                    // Body should have been read already and stored in request_body_content
+                    if let Some(body_data) = request_body_content {
+                        let filename = &p["/files/".len()..];
+                        let file_path = Path::new(directory).join(filename);
+                        println!("Attempting to write file: {:?}", file_path);
+                        match fs::write(&file_path, &body_data) {
                             Ok(_) => {
                                 status_line = "HTTP/1.1 201 Created\r\n";
-                                response_headers = "\r\n".to_string(); // No extra headers needed
-                                response_body = None; // No body for 201
                                 println!("Successfully created file: {:?}", file_path);
                             }
                             Err(e) => {
-                                // Error writing file
                                 println!("Failed to write file {:?}: {}", file_path, e);
                                 status_line = "HTTP/1.1 500 Internal Server Error\r\n";
-                                response_headers = "\r\n".to_string();
-                                response_body = None;
+                                should_close = true;
                             }
                         }
                     } else {
-                        // Error reading body from stream
-                        println!("Failed to read request body");
-                        status_line = "HTTP/1.1 400 Bad Request\r\n";
-                        response_headers = "\r\n".to_string();
-                        response_body = None;
+                        // This case is handled by the error checks at the start of routing
+                        // status_line should already be 400 or 411
+                        println!("Error: Reached POST /files/ handler without valid body data.");
                     }
-                } else {
-                    // Invalid Content-Length value
-                    println!("Invalid Content-Length header");
-                    status_line = "HTTP/1.1 400 Bad Request\r\n";
-                    response_headers = "\r\n".to_string();
-                    response_body = None;
                 }
-            } else {
-                // Content-Length header missing
-                println!("Missing Content-Length header for POST");
-                status_line = "HTTP/1.1 411 Length Required\r\n"; // Standard response for missing Content-Length on POST
-                response_headers = "\r\n".to_string();
-                response_body = None;
+                _ => {
+                    println!("Path not handled: {} {}", method, path);
+                    // Keep default 404
+                }
             }
         }
-        // --- End POST /files handling ---
-        _ => {
-            // Path not matched, keep default 404
-            println!("Path not handled: {} {}", method, path);
+
+        // --- Write Response ---
+        // Now we can get a mutable borrow of stream because `reader` is out of scope.
+        if should_close {
+            response_headers_vec.push("Connection: close".to_string());
         }
-    }
 
-    // --- Write response ---
-    stream.write_all(status_line.as_bytes())?;
-    stream.write_all(response_headers.as_bytes())?;
-    if let Some(body) = response_body {
-        stream.write_all(&body)?;
-    }
+        // Write status line
+        stream.write_all(status_line.as_bytes())?;
 
-    stream.flush()?; // Ensure all data is sent
-    println!("Response sent.");
+        // Write headers
+        for header in response_headers_vec {
+            stream.write_all(header.as_bytes())?;
+            stream.write_all(b"\r\n")?;
+        }
+        stream.write_all(b"\r\n")?; // Final CRLF
+
+        // Write body
+        if let Some(body) = response_body {
+            stream.write_all(&body)?;
+        }
+
+        stream.flush()?; // Ensure response is sent
+
+        println!("Response sent. Connection close: {}", should_close);
+
+        if should_close {
+            break; // Exit loop
+        }
+    } // End of request handling loop
+
     Ok(())
 }
