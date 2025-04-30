@@ -247,6 +247,49 @@ fn handle_connection(mut stream: TcpStream, directory: &str) -> std::io::Result<
                 ("GET", "/") => {
                     status_line = "HTTP/1.1 200 OK\r\n";
                 }
+                ("GET", "/files/") => {
+                    // Directory listing as JSON with metadata
+                    match fs::read_dir(directory) {
+                        Ok(entries) => {
+                            let mut items = Vec::new();
+                            for entry in entries.flatten() {
+                                if let (Ok(metadata), Some(name_str)) =
+                                    (entry.metadata(), entry.file_name().to_str())
+                                {
+                                    let type_str = if metadata.is_dir() {
+                                        "dir"
+                                    } else if metadata.is_file() {
+                                        "file"
+                                    } else {
+                                        "other"
+                                    };
+
+                                    items.push(format!(
+                                        "{{\"name\":\"{}\",\"type\":\"{}\",\"size\":{},\"modified\":{}}}",
+                                        name_str,
+                                        type_str,
+                                        metadata.len(),
+                                        metadata.modified()
+                                            .unwrap_or_else(|_| std::time::SystemTime::UNIX_EPOCH)
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs()
+                                    ));
+                                }
+                            }
+                            let body = format!("[{}]", items.join(","));
+                            status_line = "HTTP/1.1 200 OK\r\n";
+                            response_headers_vec.push("Content-Type: application/json".to_string());
+                            response_headers_vec.push(format!("Content-Length: {}", body.len()));
+                            response_body = Some(body.into_bytes());
+                        }
+                        Err(e) => {
+                            status_line = "HTTP/1.1 500 Internal Server Error\r\n";
+                            response_body =
+                                Some(format!("Failed to read directory: {}", e).into_bytes());
+                        }
+                    }
+                }
                 ("GET", p) if p.starts_with("/echo/") => {
                     let echo_str = &p["/echo/".len()..];
                     status_line = "HTTP/1.1 200 OK\r\n";
